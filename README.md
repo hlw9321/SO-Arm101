@@ -2,6 +2,12 @@
 
 > English documentation below; 中文说明见文末。
 
+## Download
+
+**[⬇ Download SO-ARM101.exe (Windows x64)](https://github.com/hlw9321/SO-Arm101/releases/latest/download/SO-ARM101.exe)**
+— no Python required to run the GUI. Teleoperation still needs a local
+`lerobot` environment (see *Quick Start* below).
+
 ## Overview
 
 **SO-ARM101 Control Suite** is an open-source Windows toolkit for operating the
@@ -77,6 +83,11 @@ Apache-2.0 — see [LICENSE](LICENSE).
 ---
 
 ## 中文说明
+
+### 下载
+
+**[⬇ 下载 SO-ARM101.exe（Windows x64）](https://github.com/hlw9321/SO-Arm101/releases/latest/download/SO-ARM101.exe)**
+— 运行 GUI 无需安装 Python；遥操作仍需本机已装好 `lerobot` 环境（见"快速开始"）。
 
 ### 简介
 
