@@ -1,0 +1,6 @@
+# 打包 SO-ARM101.exe 所需的依赖清单 (运行 PyInstaller 的 conda base 必须安装这些).
+# 每次打包前执行: python -m pip install -r requirements_build.txt
+# 这样换机器/重装 conda 后也不会因缺少 PySide6 / pyserial 而打包出无法启动的 exe.
+pyinstaller==6.21.0
+PySide6==6.11.1
+pyserial==3.5

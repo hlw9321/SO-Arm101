@@ -1,0 +1,10 @@
+SO-ARM101 Control Suite
+Copyright 2026 SO-ARM101 Control Suite contributors
+
+This product bundles / interacts with software developed by the lerobot
+project (https://github.com/huggingface/lerobot), which is licensed under the
+Apache License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0).
+
+When this project is distributed together with the lerobot source or its
+offline dependency wheels, the corresponding lerobot copyright notices and
+NOTICE file must be retained as required by the Apache License 2.0.
