@@ -26,6 +26,8 @@ SO-ARM101 增量控制测试上位机
 
 from __future__ import annotations
 
+__version__ = "1.0.0"  # 与 GitHub Release tag 保持一致 (如 v1.0.0)
+
 import sys
 import time
 import re
@@ -837,7 +839,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("SO-ARM101")
+        self.setWindowTitle(f"SO-ARM101 v{__version__}")
         if ICON_PATH.exists():
             self.setWindowIcon(QIcon(str(ICON_PATH)))
         self.setMinimumSize(1000, 680)
