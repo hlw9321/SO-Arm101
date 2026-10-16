@@ -83,6 +83,12 @@ def get_port_descriptions() -> dict[str, str]:
     return {p.device: p.description for p in lp.comports()}
 
 
+# 串口下拉框"禁用"选项: 仅可手动选择, 一键选择不会自动选中它.
+# data 用特殊标记, 便于 _on_connect 识别"该臂已禁用".
+_PORT_DISABLED_TEXT = "禁用 (不连接)"
+_PORT_DISABLED_DATA = "__disabled__"
+
+
 # ============================
 # 虚拟环境全盘搜索 (后台线程执行, 不卡 UI)
 # ============================
@@ -1136,9 +1142,12 @@ class MainWindow(QMainWindow):
         if not (self._ctrl and hasattr(self, "_limit_table")):
             return
         for i, j in enumerate(self._ctrl.joints):
-            for bus, sid, cols in (
-                    (self._ctrl.master_bus, j.master_id, (1, 2)),
-                    (self._ctrl.slave_bus, j.slave_id, (3, 4))):
+            buses = []
+            if self._ctrl.master_bus is not None:
+                buses.append((self._ctrl.master_bus, j.master_id, (1, 2)))
+            if self._ctrl.slave_bus is not None:
+                buses.append((self._ctrl.slave_bus, j.slave_id, (3, 4)))
+            for bus, sid, cols in buses:
                 r = None
                 for _ in range(5):
                     try:
@@ -1264,48 +1273,66 @@ class MainWindow(QMainWindow):
     # ============ UI 事件处理 ============
 
     def _on_auto_select(self):
-        """一键选择两个编号最相近的 COM 口, 点击切换主从正/反向"""
+        """一键选择 COM 口: 自动填入真实串口, 绝不选中"禁用"项.
+        若某臂已被手动设为"禁用", 则保留其禁用状态, 仅填充另一臂 (单臂测试)."""
+        master_disabled = self._master_port_cb.currentData() == _PORT_DISABLED_DATA
+        slave_disabled = self._slave_port_cb.currentData() == _PORT_DISABLED_DATA
+
         ports = get_port_descriptions()
         # 排除系统串口 COM1
         ports = {k: v for k, v in ports.items() if not k.upper().endswith("COM1")}
-        if len(ports) < 2:
-            self._log("一键选择: 可用 COM 口不足 2 个", "warn")
+        real_ports = list(ports.keys())
+        if not real_ports:
+            self._log("一键选择: 无可用 COM 口", "warn")
             return
 
-        # 提取 COM 编号并排序
-        def _port_num(p):
-            m = re.search(r'COM(\d+)', p.upper())
-            return int(m.group(1)) if m else 9999
-
-        sorted_ports = sorted(ports.keys(), key=_port_num)
-
-        # 找编号差最小的一对
-        best_a, best_b = sorted_ports[0], sorted_ports[1]
-        best_diff = _port_num(sorted_ports[1]) - _port_num(sorted_ports[0])
-        for i in range(1, len(sorted_ports) - 1):
-            diff = _port_num(sorted_ports[i + 1]) - _port_num(sorted_ports[i])
-            if diff < best_diff:
-                best_diff = diff
-                best_a, best_b = sorted_ports[i], sorted_ports[i + 1]
-
-        # 正向: 小编号→主臂, 大编号→从臂; 反向: 大编号→主臂, 小编号→从臂
-        if self._auto_select_asc:
-            m, s = best_a, best_b
-        else:
-            m, s = best_b, best_a
-
         def _set_combo(cb, port):
+            # 已被手动禁用的臂保持不变, 从而实现单臂测试
+            if cb.currentData() == _PORT_DISABLED_DATA:
+                return
             for j in range(cb.count()):
                 if cb.itemData(j) == port or cb.itemText(j).startswith(port):
                     cb.setCurrentIndex(j)
                     return
             cb.setCurrentText(port)
 
-        _set_combo(self._master_port_cb, m)
-        _set_combo(self._slave_port_cb, s)
+        def _port_num(p):
+            m = re.search(r'COM(\d+)', p.upper())
+            return int(m.group(1)) if m else 9999
 
-        direction = "正向" if self._auto_select_asc else "反向"
-        self._log(f"一键选择 ({direction}): 主臂={m}, 从臂={s}", "ok")
+        if not master_disabled and not slave_disabled:
+            # 双臂均启用: 选编号差最小的一对
+            if len(real_ports) < 2:
+                self._log("一键选择: 可用 COM 口不足 2 个", "warn")
+                return
+            sorted_ports = sorted(real_ports, key=_port_num)
+            best_a, best_b = sorted_ports[0], sorted_ports[1]
+            best_diff = _port_num(sorted_ports[1]) - _port_num(sorted_ports[0])
+            for i in range(1, len(sorted_ports) - 1):
+                diff = _port_num(sorted_ports[i + 1]) - _port_num(sorted_ports[i])
+                if diff < best_diff:
+                    best_diff = diff
+                    best_a, best_b = sorted_ports[i], sorted_ports[i + 1]
+            if self._auto_select_asc:
+                m, s = best_a, best_b
+            else:
+                m, s = best_b, best_a
+            _set_combo(self._master_port_cb, m)
+            _set_combo(self._slave_port_cb, s)
+            direction = "正向" if self._auto_select_asc else "反向"
+            self._log(f"一键选择 ({direction}): 主臂={m}, 从臂={s}", "ok")
+        elif master_disabled and not slave_disabled:
+            p = sorted(real_ports, key=_port_num)[0]
+            _set_combo(self._slave_port_cb, p)
+            self._log(f"一键选择: 主臂已禁用, 从臂={p} (单臂测试)", "ok")
+        elif slave_disabled and not master_disabled:
+            p = sorted(real_ports, key=_port_num)[0]
+            _set_combo(self._master_port_cb, p)
+            self._log(f"一键选择: 从臂已禁用, 主臂={p} (单臂测试)", "ok")
+        else:
+            self._log("一键选择: 主臂与从臂均已禁用", "warn")
+            return
+
         self._auto_select_asc = not self._auto_select_asc
 
     def _refresh_ports(self):
@@ -1315,28 +1342,33 @@ class MainWindow(QMainWindow):
             self._slave_port_cb.view().isVisible()):
             return
 
-        ports = list_serial_ports()
+        ports = list_serial_ports() or []
         desc = get_port_descriptions()
-        if not ports:
-            return
 
         def _update_combo(cb: QComboBox, ports: list[str], desc: dict):
-            # 检查端口列表是否变化, 不变就不重建
-            current_items = [cb.itemText(i) for i in range(cb.count())]
-            new_items = [f"{p} - {desc.get(p, '')}" if desc.get(p) else p for p in ports]
-            if current_items == new_items:
-                return
+            # 仅列出真实串口 (不含"禁用"项); 用于判断是否变化
+            cur_real = [cb.itemText(i) for i in range(cb.count())
+                        if cb.itemData(i) != _PORT_DISABLED_DATA]
+            new_real = [f"{p} - {desc.get(p, '')}" if desc.get(p) else p for p in ports]
+            has_disabled = any(cb.itemData(i) == _PORT_DISABLED_DATA
+                               for i in range(cb.count()))
+            if cur_real == new_real and has_disabled:
+                return  # 列表未变且"禁用"项已存在, 保持当前选择
 
-            current_data = cb.currentData()  # 用 data 恢复选中项
+            current_data = cb.currentData()  # 用 data 恢复选中项 (含"禁用"标记)
             cb.blockSignals(True)
             cb.clear()
             for p in ports:
                 label = f"{p} - {desc.get(p, '')}" if desc.get(p) else p
                 cb.addItem(label, p)
-            if current_data:
+            # 始终追加"禁用"选项 (只能手动选择, 一键选择不会选中)
+            cb.addItem(_PORT_DISABLED_TEXT, _PORT_DISABLED_DATA)
+            if current_data is not None:
                 idx = cb.findData(current_data)
                 if idx >= 0:
                     cb.setCurrentIndex(idx)
+                elif cb.count() > 1:
+                    cb.setCurrentIndex(0)  # 之前选中的真实端口已消失, 回退到首项
             cb.blockSignals(False)
 
         _update_combo(self._master_port_cb, ports, desc)
@@ -1349,17 +1381,38 @@ class MainWindow(QMainWindow):
         if self._connected:
             return
 
-        master_port = self._master_port_cb.currentData() or \
-                      self._master_port_cb.currentText().split(" - ")[0].strip()
+        def _port_of(cb):
+            data = cb.currentData()
+            if data == _PORT_DISABLED_DATA:
+                return None  # 该臂已禁用
+            if data:
+                return data
+            # 回退: 解析编辑框文本
+            return cb.currentText().split(" - ")[0].strip() or None
 
-        # 双总线设计: 主臂从臂各用一个控制板(独立串口)
-        slave_port = self._slave_port_cb.currentData() or \
-                     self._slave_port_cb.currentText().split(" - ")[0].strip()
+        master_port = _port_of(self._master_port_cb)
+        slave_port = _port_of(self._slave_port_cb)
+        master_disabled = self._master_port_cb.currentData() == _PORT_DISABLED_DATA
+        slave_disabled = self._slave_port_cb.currentData() == _PORT_DISABLED_DATA
+
+        if not master_port and not slave_port:
+            QMessageBox.warning(
+                self, "连接",
+                "请至少选择一个 COM 口, 或将不需要的臂设为\"禁用 (不连接)\"。")
+            self._log("连接失败: 未选择任何 COM 口", "error")
+            return
 
         baud = int(self._baud_cb.currentText())
 
+        # 单臂测试模式: 被禁用的臂其总线为 None, 控制器跳过该臂
+        single_arm = None
+        if master_disabled and not slave_disabled:
+            single_arm = 'slave'
+        elif slave_disabled and not master_disabled:
+            single_arm = 'master'
+
         try:
-            master_bus = SCServoBus(master_port, baud)
+            master_bus = SCServoBus(master_port, baud) if master_port else None
             slave_bus = SCServoBus(slave_port, baud) if slave_port else None
 
             self._ctrl = DeltaController(
@@ -1367,6 +1420,7 @@ class MainWindow(QMainWindow):
                 slave_bus=slave_bus,
                 joints=DEFAULT_JOINTS,
                 loop_hz=self._loop_spin.value(),
+                single_arm=single_arm,
             )
 
             # 连接回调
@@ -1377,8 +1431,14 @@ class MainWindow(QMainWindow):
             self._connected = True
             self._update_button_states()
 
-            self._log(f"已连接: 主臂={master_port}" +
-                     (f", 从臂={slave_port}" if slave_port else " (单总线模式)"), "ok")
+            parts = []
+            if master_port:
+                parts.append(f"主臂={master_port}")
+            if slave_port:
+                parts.append(f"从臂={slave_port}")
+            mode = "单臂模式" if single_arm else ("单总线模式" if not slave_port else "")
+            self._log("已连接: " + ", ".join(parts) +
+                     (f" ({mode})" if mode else ""), "ok")
             self._status_bar.showMessage("已连接 - 请使能扭矩")
 
             # 连接后自动读取舵机限位值
@@ -1445,6 +1505,14 @@ class MainWindow(QMainWindow):
 
         master_port = _port(self._master_port_cb)
         slave_port = _port(self._slave_port_cb)
+        if (self._master_port_cb.currentData() == _PORT_DISABLED_DATA or
+                self._slave_port_cb.currentData() == _PORT_DISABLED_DATA):
+            QMessageBox.warning(
+                self, "虚拟环境",
+                "遥操作需要主臂和从臂均连接。\n已禁用的臂请改选实际 COM 口"
+                "（单臂测试请直接用\"连接\"按钮本地控制）。")
+            self._log("虚拟环境: 存在被禁用的臂, 遥操作需双臂", "error")
+            return
         if not master_port or not slave_port:
             QMessageBox.warning(
                 self, "虚拟环境",
@@ -2035,8 +2103,14 @@ class MainWindow(QMainWindow):
         master_homing = {}
         slave_homing = {}
         for j in self._ctrl.joints:
-            mh = _read_homing_with_retry(self._ctrl.master_bus, j.master_id)
-            sh = _read_homing_with_retry(self._ctrl.slave_bus, j.slave_id)
+            if self._ctrl.master_bus is not None:
+                mh = _read_homing_with_retry(self._ctrl.master_bus, j.master_id)
+            else:
+                mh = None
+            if self._ctrl.slave_bus is not None:
+                sh = _read_homing_with_retry(self._ctrl.slave_bus, j.slave_id)
+            else:
+                sh = None
             # 注: 偏移校正面板已移除, 导出直接采用舵机实时 Homing 读数
             master_homing[j.master_id] = mh if mh is not None else 0
             slave_homing[j.slave_id] = sh if sh is not None else 0
@@ -2064,8 +2138,14 @@ class MainWindow(QMainWindow):
         for i, j in enumerate(self._ctrl.joints):
             mid = j.master_id
             sid = j.slave_id
-            mr = _read_limits_with_retry(self._ctrl.master_bus, mid)
-            sr = _read_limits_with_retry(self._ctrl.slave_bus, sid)
+            if self._ctrl.master_bus is not None:
+                mr = _read_limits_with_retry(self._ctrl.master_bus, mid)
+            else:
+                mr = None
+            if self._ctrl.slave_bus is not None:
+                sr = _read_limits_with_retry(self._ctrl.slave_bus, sid)
+            else:
+                sr = None
             if mr is not None:
                 master_range[mid] = mr
             else:
@@ -2098,17 +2178,19 @@ class MainWindow(QMainWindow):
             if mid in master_range:
                 mmin = int(master_range[mid][0])
                 mmax = int(master_range[mid][1])
-                self._ctrl.master_bus.write_position_limits(mid, mmin, mmax)
+                if self._ctrl.master_bus is not None:
+                    self._ctrl.master_bus.write_position_limits(mid, mmin, mmax)
             if sid in slave_range:
                 smin = int(slave_range[sid][0])
                 smax = int(slave_range[sid][1])
-                self._ctrl.slave_bus.write_position_limits(sid, smin, smax)
+                if self._ctrl.slave_bus is not None:
+                    self._ctrl.slave_bus.write_position_limits(sid, smin, smax)
             # 写 homing_offset 到 Homing_Offset (地址31, sign-magnitude)
             mh = master_homing.get(mid)
             sh = slave_homing.get(sid)
-            if mh is not None:
+            if mh is not None and self._ctrl.master_bus is not None:
                 self._ctrl.master_bus.write_homing_offset(mid, int(mh))
-            if sh is not None:
+            if sh is not None and self._ctrl.slave_bus is not None:
                 self._ctrl.slave_bus.write_homing_offset(sid, int(sh))
         self._log("舵机 EEPROM 同步完成", "ok")
 
@@ -2192,10 +2274,12 @@ class MainWindow(QMainWindow):
             try:
                 for j, mm_min, mm_max, sm_min, sm_max in targets:
                     try:
-                        if mm_min is not None and mm_max is not None:
+                        if (mm_min is not None and mm_max is not None
+                                and self._ctrl.master_bus is not None):
                             self._ctrl.master_bus.write_position_limits(
                                 j.master_id, mm_min, mm_max)
-                        if sm_min is not None and sm_max is not None:
+                        if (sm_min is not None and sm_max is not None
+                                and self._ctrl.slave_bus is not None):
                             self._ctrl.slave_bus.write_position_limits(
                                 j.slave_id, sm_min, sm_max)
                         ok_count += 1
@@ -2283,28 +2367,30 @@ class MainWindow(QMainWindow):
                 for j in self._ctrl.joints:
                     # 主臂总线
                     mr = None
-                    for _ in range(5):
-                        try:
-                            mr = self._ctrl.master_bus.read_position_limits(j.master_id)
-                            if mr is not None:
-                                break
-                        except Exception:
-                            pass
-                        time.sleep(0.1)
+                    if self._ctrl.master_bus is not None:
+                        for _ in range(5):
+                            try:
+                                mr = self._ctrl.master_bus.read_position_limits(j.master_id)
+                                if mr is not None:
+                                    break
+                            except Exception:
+                                pass
+                            time.sleep(0.1)
                     if mr is not None:
                         master_results[j.master_id] = (int(mr[0]), int(mr[1]))
                     else:
                         failed.append(f"主{j.master_id}")
                     # 从臂总线
                     sr = None
-                    for _ in range(5):
-                        try:
-                            sr = self._ctrl.slave_bus.read_position_limits(j.slave_id)
-                            if sr is not None:
-                                break
-                        except Exception:
-                            pass
-                        time.sleep(0.1)
+                    if self._ctrl.slave_bus is not None:
+                        for _ in range(5):
+                            try:
+                                sr = self._ctrl.slave_bus.read_position_limits(j.slave_id)
+                                if sr is not None:
+                                    break
+                            except Exception:
+                                pass
+                            time.sleep(0.1)
                     if sr is not None:
                         slave_results[j.slave_id] = (int(sr[0]), int(sr[1]))
                     else:
@@ -2458,6 +2544,11 @@ class MainWindow(QMainWindow):
         for sid in range(1, NUM_JOINTS + 1):
             for arm in ("master", "slave"):
                 arm_txt = "主臂" if arm == "master" else "从臂"
+                if (arm == "master" and self._ctrl.master_bus is None) or \
+                        (arm == "slave" and self._ctrl.slave_bus is None):
+                    fail_list.append(f"{arm_txt}{sid}:该臂已禁用")
+                    self._log(f"{arm_txt}舵机 ID {sid} 软件中位跳过: 该臂已禁用", "warn")
+                    continue
                 bus = (self._ctrl.master_bus if arm == "master"
                        else self._ctrl.slave_bus)
                 target = targets[sid - 1]

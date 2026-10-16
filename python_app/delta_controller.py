@@ -87,20 +87,32 @@ class DeltaController:
     """
 
     def __init__(self,
-                 master_bus: SCServoBus,
+                 master_bus: Optional[SCServoBus] = None,
                  slave_bus: Optional[SCServoBus] = None,
                  joints: Optional[list[JointConfig]] = None,
-                 loop_hz: float = 80.0):
+                 loop_hz: float = 80.0,
+                 single_arm: Optional[str] = None):
         """
         Args:
-            master_bus: 主臂舵机总线
-            slave_bus:  从臂舵机总线 (None 表示共用同一总线, 仅 ID 不同)
+            master_bus: 主臂舵机总线 (single_arm='slave' 时可传 None)
+            slave_bus:  从臂舵机总线 (None 表示共用同一总线, 仅 ID 不同;
+                        仅在 single_arm=None 时回退为 master_bus)
             joints:     关节配置列表
             loop_hz:    控制循环频率 (默认 80Hz, 12.5ms 周期)
+            single_arm: 单臂测试模式: None=双臂, 'master'=仅主臂, 'slave'=仅从臂.
+                        被禁用的臂其总线为 None, 所有相关读写自动跳过.
         """
-        self.master_bus = master_bus
-        self.slave_bus = slave_bus if slave_bus else master_bus  # 单总线模式
+        self.single_arm = single_arm
+        if single_arm is None:
+            # 双臂模式: slave_bus 缺省时回退为共用同一总线 (双臂 ID 不同)
+            self.master_bus = master_bus
+            self.slave_bus = slave_bus if slave_bus else master_bus
+        else:
+            # 单臂模式: 被禁用的臂总线为 None, 不做回退
+            self.master_bus = master_bus
+            self.slave_bus = slave_bus
         self.joints = joints or DEFAULT_JOINTS
+        self.last_error = ""
         self.loop_hz = loop_hz
         self.period = 1.0 / loop_hz
 
@@ -150,25 +162,35 @@ class DeltaController:
     def is_running(self) -> bool:
         return self._state == CtrlState.RUNNING
 
+    @property
+    def _has_master(self) -> bool:
+        """主臂总线是否可用 (未被禁用)"""
+        return self.master_bus is not None
+
+    @property
+    def _has_slave(self) -> bool:
+        """从臂总线是否可用 (未被禁用)"""
+        return self.slave_bus is not None
+
     # ============ 连接管理 ============
 
     def connect(self):
-        """打开串口并尝试 ping 所有舵机"""
-        if not self.master_bus.is_open:
+        """打开串口并尝试 ping 所有舵机 (单臂模式跳过被禁用的臂)"""
+        if self._has_master and not self.master_bus.is_open:
             self.master_bus.open()
-
-        if self.slave_bus is not self.master_bus and not self.slave_bus.is_open:
+        if self._has_slave and self.slave_bus is not self.master_bus and not self.slave_bus.is_open:
             self.slave_bus.open()
 
-        # 扫描主臂舵机
         offline = []
-        for j in self.joints:
-            if not self.master_bus.ping(j.master_id):
-                offline.append(f"主臂 ID{j.master_id}")
-        # 扫描从臂舵机
-        for j in self.joints:
-            if not self.slave_bus.ping(j.slave_id):
-                offline.append(f"从臂 ID{j.slave_id}")
+        if self._has_master:
+            for j in self.joints:
+                if not self.master_bus.ping(j.master_id):
+                    offline.append(f"主臂 ID{j.master_id}")
+        # 从臂: 单臂禁用时跳过; 共用总线时仍在同一总线上 ping 从臂 ID
+        if self._has_slave and self.single_arm != 'master':
+            for j in self.joints:
+                if not self.slave_bus.ping(j.slave_id):
+                    offline.append(f"从臂 ID{j.slave_id}")
 
         if offline:
             raise ConnectionError(f"舵机未响应: {', '.join(offline)}")
@@ -180,16 +202,29 @@ class DeltaController:
         """断开连接, 释放扭矩"""
         self.stop()
         self._release_all_torque()
-        self.master_bus.close()
-        if self.slave_bus is not self.master_bus:
+        if self._has_master:
+            self.master_bus.close()
+        if self._has_slave and self.slave_bus is not self.master_bus:
             self.slave_bus.close()
         self.state = CtrlState.IDLE
 
     # ============ 核心操作 ============
 
     def enable_all_torque(self):
-        """使能从臂扭矩, 主臂保持自由 (便于手动操作)"""
-        # 从臂: 预设跟随速度 + 使能扭矩
+        """使能舵机扭矩. 双臂: 从臂使能(主臂自由); 单臂: 使能被测臂."""
+        if self.single_arm == 'slave' and self._has_slave:
+            for j in self.joints:
+                self.slave_bus.write_u16(j.slave_id, REG_GOAL_SPEED_L, 1500)
+            self.slave_bus.sync_write_torque([(j.slave_id, True) for j in self.joints])
+            time.sleep(0.1)
+            return
+        if self.single_arm == 'master' and self._has_master:
+            for j in self.joints:
+                self.master_bus.write_u16(j.master_id, REG_GOAL_SPEED_L, 1500)
+            self.master_bus.sync_write_torque([(j.master_id, True) for j in self.joints])
+            time.sleep(0.1)
+            return
+        # 双臂模式 (默认行为)
         for j in self.joints:
             self.slave_bus.write_u16(j.slave_id, REG_GOAL_SPEED_L, 1500)
         if self.slave_bus is not self.master_bus:
@@ -198,16 +233,17 @@ class DeltaController:
         else:
             id_list = [(j.slave_id, True) for j in self.joints]
             self.master_bus.sync_write_torque(id_list)
-
         time.sleep(0.1)
 
     def _release_all_torque(self):
         """释放所有舵机扭矩"""
         try:
-            id_list = [(j.master_id, False) for j in self.joints]
-            self.master_bus.sync_write_torque(id_list)
-            id_list = [(j.slave_id, False) for j in self.joints]
-            self.slave_bus.sync_write_torque(id_list)
+            if self._has_master:
+                self.master_bus.sync_write_torque(
+                    [(j.master_id, False) for j in self.joints])
+            if self._has_slave and self.single_arm != 'master':
+                self.slave_bus.sync_write_torque(
+                    [(j.slave_id, False) for j in self.joints])
         except Exception:
             pass  # 已断连时忽略
 
@@ -231,8 +267,12 @@ class DeltaController:
             # 找到该 ID 对应的关节, 只校准指定的主臂或从臂
             for j in self.joints:
                 if arm == "master" and j.master_id == servo_id:
+                    if self.master_bus is None:
+                        raise IOError("主臂已禁用, 无法校准")
                     self._calibrate_one(self.master_bus, j.master_id)
                 elif arm == "slave" and j.slave_id == servo_id:
+                    if self.slave_bus is None:
+                        raise IOError("从臂已禁用, 无法校准")
                     self._calibrate_one(self.slave_bus, j.slave_id)
             self.last_error = ""
             return True
@@ -273,35 +313,37 @@ class DeltaController:
     def capture_zero(self) -> bool:
         """
         捕获零点基准
-        读取主臂和从臂所有舵机的当前位置, 作为初始值
-        必须在两臂摆到完全相同的物理姿态后调用
+        读取主臂和/或从臂所有舵机的当前位置, 作为初始值.
+        单臂模式下仅读取未被禁用的臂.
         """
         self.last_error = ""
         try:
             for i, j in enumerate(self.joints):
-                # 读主臂当前位置, 带重试: 一键限位等写 EEPROM 后舵机会短暂
-                # 不响应读指令, 直接读容易返回 None 误报失败.
-                pos = None
-                for _ in range(8):
-                    pos = self.master_bus.read_position(j.master_id)
-                    if pos is not None:
-                        break
-                    time.sleep(0.1)
-                if pos is None:
-                    self.last_error = f"读取主臂关节 {j.name} (ID{j.master_id}) 失败"
-                    raise IOError(self.last_error)
-                self.master_init[i] = pos
+                if self._has_master:
+                    # 读主臂当前位置, 带重试: 一键限位等写 EEPROM 后舵机会短暂
+                    # 不响应读指令, 直接读容易返回 None 误报失败.
+                    pos = None
+                    for _ in range(8):
+                        pos = self.master_bus.read_position(j.master_id)
+                        if pos is not None:
+                            break
+                        time.sleep(0.1)
+                    if pos is None:
+                        self.last_error = f"读取主臂关节 {j.name} (ID{j.master_id}) 失败"
+                        raise IOError(self.last_error)
+                    self.master_init[i] = pos
 
-                pos = None
-                for _ in range(8):
-                    pos = self.slave_bus.read_position(j.slave_id)
-                    if pos is not None:
-                        break
-                    time.sleep(0.1)
-                if pos is None:
-                    self.last_error = f"读取从臂关节 {j.name} (ID{j.slave_id}) 失败"
-                    raise IOError(self.last_error)
-                self.slave_init[i] = pos
+                if self._has_slave and self.single_arm != 'master':
+                    pos = None
+                    for _ in range(8):
+                        pos = self.slave_bus.read_position(j.slave_id)
+                        if pos is not None:
+                            break
+                        time.sleep(0.1)
+                    if pos is None:
+                        self.last_error = f"读取从臂关节 {j.name} (ID{j.slave_id}) 失败"
+                        raise IOError(self.last_error)
+                    self.slave_init[i] = pos
 
             self.master_current = list(self.master_init)
             self.slave_current = list(self.slave_init)
@@ -315,19 +357,26 @@ class DeltaController:
 
     def go_home(self):
         """
-        回零: 将从臂恢复到初始姿态
-        在 RUNNING 状态直接设置目标; 在 PAUSED 状态也会执行
+        回零: 将(被测)臂恢复到初始姿态.
+        双臂: 从臂归位; 单臂('master'): 主臂归位; 单臂('slave'): 从臂归位.
         """
         if self.state not in (CtrlState.ARMED, CtrlState.RUNNING, CtrlState.PAUSED):
             return
 
         id_pos = []
-        for i, j in enumerate(self.joints):
-            home_pos = self.slave_init[i]
-            self.slave_target[i] = home_pos
-            id_pos.append((j.slave_id, home_pos))
-        # 同步写入回零位置 (速度已在 enable_all_torque 中预置)
-        self.slave_bus.sync_write_positions(id_pos)
+        if self.single_arm == 'master' and self._has_master:
+            for i, j in enumerate(self.joints):
+                home_pos = self.master_init[i]
+                self.slave_target[i] = home_pos
+                id_pos.append((j.master_id, home_pos))
+            self.master_bus.sync_write_positions(id_pos)
+        else:
+            for i, j in enumerate(self.joints):
+                home_pos = self.slave_init[i]
+                self.slave_target[i] = home_pos
+                id_pos.append((j.slave_id, home_pos))
+            if self._has_slave:
+                self.slave_bus.sync_write_positions(id_pos)
 
     # ============ 控制循环 ============
 
@@ -399,20 +448,23 @@ class DeltaController:
             t_start = time.perf_counter()
 
             try:
-                # 1. 快速批量读取主臂所有舵机当前位置 (每个 ~1.5ms)
-                for i, j in enumerate(self.joints):
-                    pos = self.master_bus.read_position(j.master_id, wait_ms=1.0)
-                    if pos is not None:
-                        self.master_current[i] = pos
+                # 1. 读取主臂当前位置 (单臂禁用时跳过)
+                if self._has_master:
+                    for i, j in enumerate(self.joints):
+                        pos = self.master_bus.read_position(j.master_id, wait_ms=1.0)
+                        if pos is not None:
+                            self.master_current[i] = pos
 
-                # 2. 读取从臂当前实际位置 (用于实时显示)
-                for i, j in enumerate(self.joints):
-                    pos = self.slave_bus.read_position(j.slave_id, wait_ms=1.0)
-                    if pos is not None:
-                        self.slave_current[i] = pos
+                # 2. 读取从臂当前实际位置 (用于实时显示; 禁用时跳过)
+                if self._has_slave and self.single_arm != 'master':
+                    for i, j in enumerate(self.joints):
+                        pos = self.slave_bus.read_position(j.slave_id, wait_ms=1.0)
+                        if pos is not None:
+                            self.slave_current[i] = pos
 
                 # 3. 若已开启控制, 计算增量并映射到从臂目标, 同步写入从臂
-                if self._write_slave:
+                #    单臂模式下无"主→从"映射关系, 仅实时读取显示, 不写从臂
+                if self._write_slave and self._has_master and self._has_slave and self.single_arm != 'master':
                     id_pos = []
                     for i, j in enumerate(self.joints):
                         delta_raw = self.master_current[i] - self.master_init[i]
@@ -423,7 +475,6 @@ class DeltaController:
                         # 叠加偏移校正量 (手动微调), 使 RUNNING 状态下也能实时校正从臂
                         target += self.slave_trim_offset[i]
                         # 硬件保护: 不超出舵机物理范围 0~4095
-                        # (软限位已取消, 从臂可全范围跟随主臂)
                         target = max(0, min(4095, target))
 
                         self.slave_target[i] = target
