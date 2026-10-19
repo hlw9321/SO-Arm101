@@ -26,7 +26,7 @@ SO-ARM101 增量控制测试上位机
 
 from __future__ import annotations
 
-__version__ = "1.0.0"  # 与 GitHub Release tag 保持一致 (如 v1.0.0)
+__version__ = "1.1.0"  # 与 GitHub Release tag 保持一致 (如 v1.1.0)
 
 import sys
 import time
@@ -56,7 +56,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import (
     Qt, QTimer, Signal, Slot, QThread, QObject,
-    QPoint,
+    QPoint, QRect,
 )
 from PySide6.QtGui import QColor, QFont, QPalette, QIcon
 
@@ -533,7 +533,14 @@ def restart_all_com_devices() -> tuple[bool, str]:
 # ============================
 
 class JointBar(QWidget):
-    """单关节旋转值指示条 — 右侧面板专用"""
+    """单关节旋转值指示条 — 右侧面板专用
+
+    交互模式 (set_interactive(True), 用于实时偏移量面板):
+      - 只显示开关选中的臂 (set_show_slave), 指示器可直接拖动;
+      - 拖动时发出 dragged(值) 信号 (值域即 set_limits 设定的范围);
+      - 并叠加橙色目标标记 (set_target)."""
+
+    dragged = Signal(float)
 
     def __init__(self, label: str = "", parent=None):
         super().__init__(parent)
@@ -548,9 +555,30 @@ class JointBar(QWidget):
         self._m_min = None
         self._s_max = None
         self._s_min = None
+        # 交互 (拖动控制) 状态
+        self._interactive = False
+        self._show_slave = False
+        self._dragging = False
+        self._target: float | None = None
         self.setMinimumHeight(56)
         self.setFixedHeight(56)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+    def set_interactive(self, enabled: bool):
+        self._interactive = enabled
+        self.setCursor(Qt.PointingHandCursor if enabled else Qt.ArrowCursor)
+        if not enabled:
+            self._dragging = False
+        self.update()
+
+    def set_show_slave(self, show_slave: bool):
+        """交互模式下显示哪条臂 (False=主臂蓝, True=从臂绿)"""
+        self._show_slave = show_slave
+        self.update()
+
+    def set_target(self, value: float | None):
+        self._target = value
+        self.update()
 
     def set_limits(self, min_deg: float, max_deg: float):
         self._min_deg = min_deg
@@ -586,6 +614,50 @@ class JointBar(QWidget):
             if self._s_min is None or slave_deg < self._s_min:
                 self._s_min = slave_deg
         self.update()
+
+    # ---- 拖动交互 ----
+
+    def _bar_geometry(self) -> tuple[int, int]:
+        """与 paintEvent 一致的条形区左右 x 坐标"""
+        from PySide6.QtGui import QFontMetrics, QFont
+        font_label = QFont(self.font())
+        font_label.setPointSize(10)
+        name_w = QFontMetrics(font_label).horizontalAdvance(self._label)
+        return name_w + 16, self.width() - 10
+
+    def _value_at(self, x: float) -> float | None:
+        """把指针 x 坐标换算为条上的值 (夹在范围内)"""
+        bar_left, bar_right = self._bar_geometry()
+        if bar_right - bar_left < 40:
+            return None
+        ratio = (x - bar_left) / (bar_right - bar_left)
+        ratio = max(0.0, min(1.0, ratio))
+        return self._min_deg + ratio * (self._max_deg - self._min_deg)
+
+    def mousePressEvent(self, event):
+        if self._interactive:
+            v = self._value_at(event.position().x())
+            if v is not None:
+                self._dragging = True
+                self._target = v
+                self.update()
+                self.dragged.emit(v)
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._dragging and self._interactive:
+            v = self._value_at(event.position().x())
+            if v is not None:
+                self._target = v
+                self.update()
+                self.dragged.emit(v)
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._dragging = False
+        super().mouseReleaseEvent(event)
 
     def _deg_to_x(self, deg: float, left: int, right: int) -> int:
         span = self._max_deg - self._min_deg
@@ -643,25 +715,41 @@ class JointBar(QWidget):
         zero_x = max(bar_left, min(bar_right, zero_x))
         p.drawLine(zero_x, bar_y - 6, zero_x, bar_y + bar_h + 6)
 
-        # 主臂指示 (蓝色圆点)
-        mx = self._deg_to_x(self._master_deg, bar_left, bar_right)
-        mx = max(bar_left, min(bar_right, mx))
-        p.setBrush(QColor(52, 152, 219))
-        p.setPen(QtGui.QPen(QColor(255, 255, 255), 1.5))
-        p.drawEllipse(int(mx - 6), bar_mid - 6, 12, 12)
+        if self._interactive:
+            # 交互模式 (偏移面板): 只显示开关选中的臂 + 拖动目标标记
+            cur = self._slave_deg if self._show_slave else self._master_deg
+            cx = self._deg_to_x(cur, bar_left, bar_right)
+            cx = max(bar_left, min(bar_right, cx))
+            p.setBrush(QColor(46, 204, 113) if self._show_slave else QColor(52, 152, 219))
+            p.setPen(QtGui.QPen(QColor(255, 255, 255), 1.5))
+            p.drawEllipse(int(cx - 7), bar_mid - 7, 14, 14)
+            if self._target is not None:
+                tx = self._deg_to_x(self._target, bar_left, bar_right)
+                tx = max(bar_left, min(bar_right, tx))
+                p.setBrush(Qt.NoBrush)
+                p.setPen(QtGui.QPen(QColor(230, 126, 34), 2))
+                p.drawLine(tx, bar_y - 6, tx, bar_y + bar_h + 6)
+        else:
+            # 非交互 (raw 面板): 同时显示主臂圆点 + 从臂钻石
+            # 主臂指示 (蓝色圆点)
+            mx = self._deg_to_x(self._master_deg, bar_left, bar_right)
+            mx = max(bar_left, min(bar_right, mx))
+            p.setBrush(QColor(52, 152, 219))
+            p.setPen(QtGui.QPen(QColor(255, 255, 255), 1.5))
+            p.drawEllipse(int(mx - 6), bar_mid - 6, 12, 12)
 
-        # 从臂指示 (绿色钻石)
-        sx = self._deg_to_x(self._slave_deg, bar_left, bar_right)
-        sx = max(bar_left, min(bar_right, sx))
-        diamond = QtGui.QPolygon([
-            QPoint(int(sx), bar_mid - 7),
-            QPoint(int(sx) + 7, bar_mid),
-            QPoint(int(sx), bar_mid + 7),
-            QPoint(int(sx) - 7, bar_mid),
-        ])
-        p.setBrush(QColor(46, 204, 113))
-        p.setPen(QtGui.QPen(QColor(255, 255, 255), 1))
-        p.drawPolygon(diamond)
+            # 从臂指示 (绿色钻石)
+            sx = self._deg_to_x(self._slave_deg, bar_left, bar_right)
+            sx = max(bar_left, min(bar_right, sx))
+            diamond = QtGui.QPolygon([
+                QPoint(int(sx), bar_mid - 7),
+                QPoint(int(sx) + 7, bar_mid),
+                QPoint(int(sx), bar_mid + 7),
+                QPoint(int(sx) - 7, bar_mid),
+            ])
+            p.setBrush(QColor(46, 204, 113))
+            p.setPen(QtGui.QPen(QColor(255, 255, 255), 1))
+            p.drawPolygon(diamond)
 
         # ---------- 移动记录 max/min 标记 (仅 raw 面板) ----------
         if self._record_enabled:
@@ -700,17 +788,73 @@ class JointBar(QWidget):
         slave_text = f"{self._slave_deg:.0f}"
         master_w = fm_range.horizontalAdvance(master_text)
         slave_w = fm_range.horizontalAdvance(slave_text)
-        # 主臂值(蓝色) + 从臂值(绿色) 并排显示在中位刻度右侧
-        p.setPen(QColor(52, 152, 219))
-        p.drawText(mid_x + 4, bar_y + bar_h + 18, master_text)
-        p.setPen(QColor(46, 204, 113))
-        p.drawText(mid_x + 4 + master_w + 4, bar_y + bar_h + 18, slave_text)
+        if self._interactive:
+            # 交互模式: 只显示开关选中臂的当前值
+            if self._show_slave:
+                p.setPen(QColor(46, 204, 113))
+                p.drawText(mid_x + 4, bar_y + bar_h + 18, slave_text)
+            else:
+                p.setPen(QColor(52, 152, 219))
+                p.drawText(mid_x + 4, bar_y + bar_h + 18, master_text)
+        else:
+            # 主臂值(蓝色) + 从臂值(绿色) 并排显示在中位刻度右侧
+            p.setPen(QColor(52, 152, 219))
+            p.drawText(mid_x + 4, bar_y + bar_h + 18, master_text)
+            p.setPen(QColor(46, 204, 113))
+            p.drawText(mid_x + 4 + master_w + 4, bar_y + bar_h + 18, slave_text)
 
         max_text = f"{self._max_deg:.0f}"
         max_w = fm_range.horizontalAdvance(max_text)
         p.setPen(QColor(120, 120, 120))
         p.drawText(bar_right - max_w, bar_y + bar_h + 18, max_text)
 
+        p.end()
+
+
+class ArmToggle(QWidget):
+    """左右波动开关: 选择拖动控制作用于主臂(左)还是从臂(右).
+
+    toggled(True) 表示从臂(右), toggled(False) 表示主臂(左)."""
+
+    toggled = Signal(bool)
+
+    def __init__(self, parent=None, w: int = 132, h: int = 30, font_pt: int = 9):
+        super().__init__(parent)
+        self._is_slave = False
+        self._font_pt = font_pt
+        self.setFixedSize(w, h)
+        self.setCursor(Qt.PointingHandCursor)
+
+    def set_slave(self, v: bool):
+        if self._is_slave != v:
+            self._is_slave = v
+            self.update()
+
+    def mousePressEvent(self, event):
+        self._is_slave = not self._is_slave
+        self.update()
+        self.toggled.emit(self._is_slave)
+
+    def paintEvent(self, event):
+        from PySide6.QtGui import QPainter, QFont as _QFont
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        r = h / 2
+        # 轨道: 主臂蓝 / 从臂绿
+        track = QColor(52, 152, 219) if not self._is_slave else QColor(46, 204, 113)
+        p.setBrush(track)
+        p.setPen(Qt.NoPen)
+        p.drawRoundedRect(0, 0, w, h, r, r)
+        # 两侧文字
+        p.setFont(_QFont("Microsoft YaHei", self._font_pt, _QFont.Bold))
+        p.setPen(QColor(255, 255, 255))
+        p.drawText(QRect(0, 0, w // 2, h), Qt.AlignCenter, "主臂")
+        p.drawText(QRect(w // 2, 0, w // 2, h), Qt.AlignCenter, "从臂")
+        # 旋钮
+        p.setBrush(QColor(255, 255, 255))
+        kx = w - h if self._is_slave else 0
+        p.drawRoundedRect(kx, 0, h, h, r, r)
         p.end()
 
 
@@ -1124,15 +1268,226 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(9, 0, 9, 9)
         layout.setSpacing(0)
 
+        # ---------- 右上角: 拖动控制开关 (紧凑) ----------
+        top_row = QHBoxLayout()
+        top_row.addStretch(1)
+        self._drag_arm_hint = QLabel("拖动: 主臂")
+        self._drag_arm_hint.setStyleSheet("color:#888; font-size:11px;")
+        top_row.addWidget(self._drag_arm_hint)
+        # 拖动控制总开关: 开启后才能拖动各关节; 高亮蓝=开, 灰色=关
+        self._drag_enabled = False
+        self._drag_enable_btn = QPushButton("拖动控制")
+        self._drag_enable_btn.setCheckable(True)
+        self._drag_enable_btn.setChecked(False)
+        self._drag_enable_btn.setFixedSize(72, 22)
+        self._drag_enable_btn.setCursor(Qt.PointingHandCursor)
+        self._drag_enable_btn.setToolTip(
+            "开启后可直接拖动下方 1~6 号关节条手动 jog 对应臂; 再按一次关闭。\n"
+            "关闭时偏移条只作显示, 不可拖动。")
+        self._drag_enable_btn.setStyleSheet(
+            "QPushButton{background:#3a3f44;color:#c7cbd1;border:1px solid #555;"
+            "border-radius:4px;font-size:11px;}"
+            "QPushButton:checked{background:#3498db;color:#ffffff;border:1px solid #3498db;"
+            "font-weight:bold;}")
+        self._drag_enable_btn.toggled.connect(self._on_drag_enable_toggled)
+        top_row.addWidget(self._drag_enable_btn)
+        self._arm_toggle = ArmToggle(w=96, h=22, font_pt=8)
+        self._arm_toggle.setToolTip(
+            "左右波动开关选择拖动控制主臂还是从臂; 条上的指示器可直接拖动,"
+            "目标位置写入对应臂舵机。任意状态下均可单独控制: 双臂运行中拖从臂会"
+            "自动接管(暂停跟随映射)单独控制从臂; 拖主臂则自动恢复 主→从 跟随。")
+        self._arm_toggle.toggled.connect(self._on_arm_toggle)
+        top_row.addWidget(self._arm_toggle)
+        layout.addLayout(top_row)
+
+        # 偏移条本身即可拖动 (交互模式), 显示跟随开关切换的臂
         self._offset_bars: list[JointBar] = []
         for i in range(NUM_JOINTS):
             bar = JointBar(DEFAULT_JOINTS[i].name)
             # 偏移量范围: 相对零点的偏移量, 刻度范围 ±2048
             bar.set_limits(-2048.0, 2048.0)
+            bar.set_interactive(False)
+            bar.dragged.connect(lambda v, idx=i: self._on_drag_bar_changed(idx, v))
             layout.addWidget(bar)
             self._offset_bars.append(bar)
 
+        # 拖动写入: 50ms 节流定时器, 批量写变化关节, 避免拖动卡 UI
+        self._drag_pending: dict[int, int] = {}
+        self._drag_torque_armed: set[str] = set()   # 已使能扭矩的臂 {'master','slave'}
+        self._drag_err_streak = 0                   # 连续写失败计数 (抑制日志刷屏)
+        self._drag_arm_is_slave = False
+        self._drag_timer = QTimer(self)
+        self._drag_timer.setInterval(50)
+        self._drag_timer.timeout.connect(self._on_drag_timer)
+        self._drag_timer.start()
+
         return g
+
+    # ============ 拖动控制 (手动 jog) ============
+
+    def _drag_loop_writes_slave(self) -> bool:
+        """运行时控制循环是否会写从臂 — 仅双臂模式 (主从都在) 才会跟随写.
+        单臂模式下循环只读不写, 运行中也可直接拖动从臂."""
+        c = self._ctrl
+        return bool(c and c.master_bus is not None and c.slave_bus is not None)
+
+    def _drag_bus(self):
+        """根据开关状态返回当前选中的总线 (None 表示该臂已禁用/未连接)"""
+        if not self._ctrl:
+            return None
+        return self._ctrl.slave_bus if self._drag_arm_is_slave else self._ctrl.master_bus
+
+    def _on_arm_toggle(self, is_slave: bool):
+        """左右波动开关切换控制臂 (False=主臂, True=从臂).
+        偏移条的显示与拖动目标同步切换到所选臂."""
+        self._drag_arm_is_slave = is_slave
+        for bar in self._offset_bars:
+            bar.set_show_slave(is_slave)
+            bar.set_target(None)
+        self._update_drag_states()
+
+    def _on_drag_bar_changed(self, idx: int, offset: float):
+        """偏移条拖动: 把条上的偏移量换算为目标 raw 值, 下一拍定时器批量写入.
+
+        目标 raw = 该臂零点 raw + 拖动偏移量, 夹在 0~4095."""
+        if not self._ctrl:
+            return
+        if self._drag_arm_is_slave:
+            zero = self._zero_s_deg[idx] if idx < len(self._zero_s_deg) else 0.0
+        else:
+            zero = self._zero_m_deg[idx] if idx < len(self._zero_m_deg) else 0.0
+        raw = int(round(zero + offset))
+        raw = max(0, min(4095, raw))
+        self._offset_bars[idx].set_target(offset)
+        self._drag_pending[idx] = raw
+
+    def _on_drag_timer(self):
+        """50ms 节流: 把变化关节的目标位置写入当前选中臂舵机.
+
+        任意状态下主臂/从臂均可单独控制:
+        - 主臂: 任意状态直接写 (控制循环只读主臂不写); 拖主臂同时清除从臂
+          接管, 恢复 主→从 跟随.
+        - 从臂: 待机/单臂模式直接写; 双臂运行中则接管 (暂停跟随映射), 目标
+          交给控制循环写, 避免与循环并发写同一总线. 写前自动使能该臂扭矩.
+
+        仅在拖动控制总开关 (_drag_enabled) 打开时才写入."""
+        if not self._drag_enabled:
+            self._drag_pending.clear()
+            return
+        if not self._drag_pending:
+            return
+        bus = self._drag_bus()
+        if bus is None:
+            self._drag_pending.clear()
+            return
+        running_slave = (self._drag_arm_is_slave
+                         and self._drag_loop_writes_slave()
+                         and self._ctrl.state == CtrlState.RUNNING)
+
+        arm_key = "slave" if self._drag_arm_is_slave else "master"
+        arm_name = "从臂" if self._drag_arm_is_slave else "主臂"
+        try:
+            # 首次拖动该臂: 先确保扭矩已使能, 否则舵机不动作
+            if arm_key not in self._drag_torque_armed:
+                ids = [(j.slave_id if self._drag_arm_is_slave else j.master_id)
+                       for j in self._ctrl.joints]
+                bus.sync_write_torque([(sid, True) for sid in ids])
+                self._drag_torque_armed.add(arm_key)
+                self._log(f"拖动控制: 已自动使能{arm_name}扭矩", "info")
+
+            if self._drag_arm_is_slave and running_slave:
+                # 运行中拖从臂: 接管 (暂停跟随映射), 目标交给控制循环写,
+                # 避免与循环并发写同一总线. 循环按 12.5ms 周期写, 响应足够.
+                for idx, val in self._drag_pending.items():
+                    self._ctrl.slave_target[idx] = int(val)
+                self._ctrl.engage_slave_override()
+                self._drag_pending.clear()
+                self._drag_err_streak = 0
+                self._update_drag_states()
+                return
+
+            writes = []
+            for idx, val in self._drag_pending.items():
+                j = self._ctrl.joints[idx]
+                sid = j.slave_id if self._drag_arm_is_slave else j.master_id
+                writes.append((sid, int(val)))
+            if self._drag_arm_is_slave:
+                bus.sync_write_positions(writes)
+            else:
+                for sid, val in writes:
+                    bus.set_position(sid, val)
+                # 拖主臂 = 重新接管主臂驱动: 清除从臂接管, 循环恢复 主→从 跟随.
+                # 主臂位置已写, 循环读新位置后从臂会跟随到位.
+                self._ctrl.resume_follow()
+                self._update_drag_states()
+            self._drag_pending.clear()
+            self._drag_err_streak = 0
+        except Exception as e:
+            # 抑制日志刷屏: 连续失败只在第 1 次和之后每 20 次记一条
+            self._drag_err_streak += 1
+            if self._drag_err_streak == 1 or self._drag_err_streak % 20 == 0:
+                self._log(f"拖动控制写入失败({self._drag_err_streak}次): {e}", "error")
+            self._drag_pending.clear()
+
+    def _on_drag_enable_toggled(self, on: bool):
+        """拖动控制总开关: 开=可拖动各关节手动 jog; 关=偏移条仅显示.
+
+        关闭时失能主臂扭矩, 恢复手摇 (双臂模式下主臂本应自由; 从臂不受
+        影响, 继续由跟随控制)."""
+        self._drag_enabled = on
+        if not on:
+            self._drag_pending.clear()
+            self._release_master_for_hand()
+            # 控制从臂期间可能处于手动接管态 (暂停了 主→从 映射);
+            # 关闭拖动控制时清除接管, 恢复主臂控制从臂 (跟随).
+            if self._ctrl:
+                self._ctrl.resume_follow()
+        self._update_drag_states()
+
+    def _release_master_for_hand(self):
+        """失能主臂扭矩, 恢复手摇 (仅双臂模式).
+
+        双臂模式下主臂设计为自由/手摇, 只有拖动控制开启并拖动主臂时才会
+        临时使能其扭矩; 关闭拖动控制时统一失能, 避免主臂被锁死无法手摇."""
+        c = self._ctrl
+        if not c or c.master_bus is None or c.single_arm is not None:
+            return
+        try:
+            c.master_bus.sync_write_torque([(j.master_id, False) for j in c.joints])
+            self._drag_torque_armed.discard("master")
+            self._log("拖动控制关闭: 主臂已失能, 可手摇", "info")
+        except Exception as e:
+            self._log(f"失能主臂扭矩失败: {e}", "error")
+
+    def _update_drag_states(self):
+        """根据开关/连接/禁用/运行状态刷新偏移条拖动可用性及提示文案.
+
+        拖动控制总开关 (_drag_enabled) 打开后才可拖动; 打开后任意状态下
+        主臂/从臂均可单独拖动: 从臂在运行中拖动会自动接管 (暂停跟随映射,
+        改由用户 jog 控制)."""
+        connected = bool(self._ctrl)
+        bus = self._drag_bus()
+        arm_present = bus is not None
+        enabled = self._drag_enabled and connected and arm_present
+        for bar in self._offset_bars:
+            bar.set_interactive(enabled)
+            if not enabled:
+                bar.set_target(None)
+
+        slave_over = bool(self._ctrl) and self._drag_arm_is_slave and self._ctrl.slave_override
+
+        if not self._drag_enabled:
+            self._drag_arm_hint.setText("拖动: 关")
+        elif not connected:
+            self._drag_arm_hint.setText("未连接")
+        elif not arm_present:
+            self._drag_arm_hint.setText("当前臂已禁用")
+        elif slave_over:
+            self._drag_arm_hint.setText("从臂手动接管中")
+        elif self._drag_arm_is_slave and self._drag_loop_writes_slave():
+            self._drag_arm_hint.setText("拖从臂=接管(停跟随)")
+        else:
+            self._drag_arm_hint.setText("拖动: 从臂" if self._drag_arm_is_slave else "拖动: 主臂")
 
 
     def _read_back_limits_to_table(self):
@@ -1430,6 +1785,15 @@ class MainWindow(QMainWindow):
             self._ctrl.connect()
             self._connected = True
             self._update_button_states()
+            # 重置拖动控制扭矩使能状态; 自动选中可用臂 (禁用的臂不可拖动)
+            self._drag_torque_armed.clear()
+            if self._ctrl.master_bus is None and self._ctrl.slave_bus is not None:
+                self._drag_arm_is_slave = True
+                self._arm_toggle.set_slave(True)
+            elif self._ctrl.slave_bus is None and self._ctrl.master_bus is not None:
+                self._drag_arm_is_slave = False
+                self._arm_toggle.set_slave(False)
+            self._update_drag_states()
 
             parts = []
             if master_port:
@@ -1484,6 +1848,10 @@ class MainWindow(QMainWindow):
         self._fill_04095_btn.setEnabled(False)
         self._fill_raw_btn.setEnabled(False)
         self._update_button_states()
+        # 断开后重置拖动控制状态
+        self._drag_torque_armed.clear()
+        self._drag_pending.clear()
+        self._update_drag_states()
         self._log("已断开连接", "ok")
         self._status_bar.showMessage("已断开 - 请选择串口")
 
@@ -2343,6 +2711,8 @@ class MainWindow(QMainWindow):
             time.sleep(0.2)
             self._ctrl.disable_all_torque()
             self._torque_enabled = False
+            # 扭矩失能后, 下次拖动需重新使能对应臂
+            self._drag_torque_armed.clear()
             self._log("所有舵机扭矩已失能, 从臂停止跟随", "warn")
             self._status_bar.showMessage("扭矩已失能 - 舵机可自由转动")
         except Exception as e:
@@ -2743,6 +3113,8 @@ class MainWindow(QMainWindow):
             f"QLabel {{ background-color: #333; color: {color}; "
             f"border-radius: 4px; padding: 6px; font-weight: bold; }}")
         self._update_button_states()
+        # 运行状态变化影响从臂拖动可用性 (运行时从臂不可直接拖动)
+        self._update_drag_states()
 
     @Slot(str)
     def _on_status_msg(self, msg: str):

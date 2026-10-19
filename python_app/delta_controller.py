@@ -21,6 +21,7 @@
 
 import time
 import threading
+import serial
 from dataclasses import dataclass, field
 from typing import Optional, Callable
 from enum import Enum, auto
@@ -135,6 +136,9 @@ class DeltaController:
         self._stop_event = threading.Event()
         # 是否向从臂写位置 (False=仅实时读取显示, True=控制从臂跟随)
         self._write_slave = False
+        # 手动接管从臂: True 时控制循环不再做 主→从 映射, 改为写用户 jog 的目标值.
+        # 这样在任意运行状态都能单独控制从臂, 不被跟随写覆盖.
+        self.slave_override = False
 
         # 回调
         self.on_state_change: Optional[Callable[[CtrlState], None]] = None
@@ -396,7 +400,31 @@ class DeltaController:
         if self.state != CtrlState.ARMED:
             return
         self._write_slave = True
+        self.slave_override = False
         self.state = CtrlState.RUNNING
+
+    def slave_is_under_loop(self) -> bool:
+        """当前从臂是否由控制循环写入 (运行中+双臂模式).
+
+        用于判断拖动从臂时能否直接写总线, 还是必须先接管."""
+        return (self._write_slave and self._has_slave
+                and self.single_arm != 'master')
+
+    def engage_slave_override(self):
+        """手动接管从臂: 暂停 主→从 跟随映射, 改为写用户 jog 的目标值.
+
+        仅在从臂被循环控制时有意义. 接管时把各关节目标初始化为从臂当前
+        实际位置, 避免其它未拖动的关节被写回 0."""
+        if self.slave_override:
+            return
+        if not self.slave_is_under_loop():
+            return
+        self.slave_target = list(self.slave_current)
+        self.slave_override = True
+
+    def resume_follow(self):
+        """恢复 主→从 跟随 (清除手动接管)."""
+        self.slave_override = False
 
     def stop(self):
         """停止控制循环"""
@@ -466,19 +494,26 @@ class DeltaController:
                 #    单臂模式下无"主→从"映射关系, 仅实时读取显示, 不写从臂
                 if self._write_slave and self._has_master and self._has_slave and self.single_arm != 'master':
                     id_pos = []
-                    for i, j in enumerate(self.joints):
-                        delta_raw = self.master_current[i] - self.master_init[i]
-                        if j.reversed:
-                            delta_raw = -delta_raw
+                    if self.slave_override:
+                        # 手动接管从臂: 直接写用户 jog 的目标, 不做 主→从 映射
+                        for i, j in enumerate(self.joints):
+                            target = max(0, min(4095, int(round(self.slave_target[i]))))
+                            self.slave_target[i] = target
+                            id_pos.append((j.slave_id, target))
+                    else:
+                        for i, j in enumerate(self.joints):
+                            delta_raw = self.master_current[i] - self.master_init[i]
+                            if j.reversed:
+                                delta_raw = -delta_raw
 
-                        target = self.slave_init[i] + delta_raw
-                        # 叠加偏移校正量 (手动微调), 使 RUNNING 状态下也能实时校正从臂
-                        target += self.slave_trim_offset[i]
-                        # 硬件保护: 不超出舵机物理范围 0~4095
-                        target = max(0, min(4095, target))
+                            target = self.slave_init[i] + delta_raw
+                            # 叠加偏移校正量 (手动微调), 使 RUNNING 状态下也能实时校正从臂
+                            target += self.slave_trim_offset[i]
+                            # 硬件保护: 不超出舵机物理范围 0~4095
+                            target = max(0, min(4095, target))
 
-                        self.slave_target[i] = target
-                        id_pos.append((j.slave_id, target))
+                            self.slave_target[i] = target
+                            id_pos.append((j.slave_id, target))
 
                     # 同步写入从臂 (速度已预设在 enable_all_torque 中)
                     self.slave_bus.sync_write_positions(id_pos)

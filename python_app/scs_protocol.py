@@ -20,6 +20,7 @@ SCS 总线舵机串口协议层
 import struct
 import time
 import serial
+import threading
 from dataclasses import dataclass
 from typing import Optional
 
@@ -122,6 +123,9 @@ class SCServoBus:
         self.port = port
         self.baudrate = baudrate
         self._ser: Optional["serial.Serial"] = None
+        # 总线收发锁: 串行化所有 tx/rx 事务, 避免控制循环线程与拖动(
+        # 定时器)线程并发访问同一串口句柄导致 ClearCommError/访问拒绝.
+        self._lock = threading.RLock()
 
     # ---- 连接管理 ----
 
@@ -151,8 +155,9 @@ class SCServoBus:
             raise IOError(f"无法打开串口 {self.port}")
 
     def close(self):
-        if self._ser and self._ser.is_open:
-            self._ser.close()
+        with self._lock:
+            if self._ser and self._ser.is_open:
+                self._ser.close()
 
     @property
     def is_open(self) -> bool:
@@ -176,8 +181,9 @@ class SCServoBus:
         packet.append(cmd)
         packet.extend(params)
         packet.append(checksum(packet[2:]))
-        self._ser.write(bytes(packet))
-        self._ser.flush()
+        with self._lock:
+            self._ser.write(bytes(packet))
+            self._ser.flush()
         # 等待舵机处理 (STM32 内核处理约 200~500us)
         time.sleep(0.0005)
 
@@ -243,10 +249,11 @@ class SCServoBus:
     def read_bytes(self, servo_id: int, reg_addr: int, length: int,
                    wait_ms: float = 1.0) -> Optional[bytes]:
         """读取连续寄存器, wait_ms 控制发收间隔 (默认 1ms)"""
-        params = bytes([reg_addr, length])
-        self._send_packet(servo_id, CMD_READ, params)
-        time.sleep(wait_ms / 1000.0)
-        resp = self._read_response(servo_id, CMD_READ, length)
+        with self._lock:
+            params = bytes([reg_addr, length])
+            self._send_packet(servo_id, CMD_READ, params)
+            time.sleep(wait_ms / 1000.0)
+            resp = self._read_response(servo_id, CMD_READ, length)
         if resp is None or len(resp) < length:
             return None
         return resp[:length]
